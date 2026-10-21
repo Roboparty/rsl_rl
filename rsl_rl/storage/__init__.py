@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Implementation of transitions storage for RL-agent."""
+"""Storage for the learning algorithms."""
 
 from .rollout_storage import RolloutStorage
 from .circular_buffer import CircularBuffer

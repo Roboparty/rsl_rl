@@ -21,6 +21,7 @@ class OuterClass:
 
     @staticmethod
     def static_method() -> str:
+        """Return a static marker string for callable resolution tests."""
         return "static"
 
 
@@ -135,14 +136,14 @@ class TestResolveCallableErrors:
     def test_type_error_none(self) -> None:
         """Should raise TypeError for None input."""
         with pytest.raises(TypeError, match="Expected callable or string"):
-            resolve_callable(None)
+            resolve_callable(None)  # type: ignore
 
     def test_type_error_int(self) -> None:
         """Should raise TypeError for int input."""
         with pytest.raises(TypeError, match="Expected callable or string"):
-            resolve_callable(42)
+            resolve_callable(42)  # type: ignore
 
     def test_type_error_list(self) -> None:
         """Should raise TypeError for list input."""
         with pytest.raises(TypeError, match="Expected callable or string"):
-            resolve_callable(["PPO"])
+            resolve_callable(["PPO"])  # type: ignore

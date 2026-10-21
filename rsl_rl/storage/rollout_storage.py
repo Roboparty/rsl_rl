@@ -3,32 +3,15 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+
 from __future__ import annotations
 
 import torch
 from collections.abc import Generator
 from tensordict import TensorDict
 
-from rsl_rl.networks import HiddenState
+from rsl_rl.modules import HiddenState
 from rsl_rl.utils import split_and_pad_trajectories
-
-
-def _allocate_rollout_obs_buffer(obs_template: TensorDict, num_transitions_per_env: int, device: str) -> TensorDict:
-    """Allocate a rollout TensorDict with the same layout as ``obs_template`` (including nested groups).
-
-    The default ``TensorDict`` shape for a *nested* group (e.g. policy with ``concatenate_terms=False``) only reflects
-    batch dimensions. Using ``torch.zeros(T, *value.shape)`` in that case drops all feature dimensions and corrupts
-    training (symmetry / encoder). This helper prepends a time dimension while preserving leaves.
-    """
-
-    def expand(node: TensorDict | torch.Tensor) -> TensorDict | torch.Tensor:
-        if isinstance(node, torch.Tensor):
-            return torch.zeros(num_transitions_per_env, *node.shape, device=device, dtype=node.dtype)
-        children = {k: expand(v) for k, v in node.items()}
-        return TensorDict(children, batch_size=torch.Size([num_transitions_per_env, *node.batch_size]))
-
-    top = {k: expand(v) for k, v in obs_template.items()}
-    return TensorDict(top, batch_size=torch.Size([num_transitions_per_env, *obs_template.batch_size]), device=device)
 
 
 class RolloutStorage:
@@ -39,22 +22,105 @@ class RolloutStorage:
     """
 
     class Transition:
-        """Storage for a single state transition."""
+        """Storage for a single state transition.
+
+        This class is populated incrementally during the rollout phase and then passed to
+        :meth:`RolloutStorage.add_transition` to record the data.
+        """
 
         def __init__(self) -> None:
+            """Initialize an empty transition container."""
             self.observations: TensorDict | None = None
+            """Observations at the current step."""
+
             self.actions: torch.Tensor | None = None
-            self.privileged_actions: torch.Tensor | None = None
+            """Actions taken at the current step."""
+
             self.rewards: torch.Tensor | None = None
+            """Rewards received after the action."""
+
             self.dones: torch.Tensor | None = None
+            """Done flags indicating episode termination."""
+
+            # For reinforcement learning
             self.values: torch.Tensor | None = None
-            self.actions_log_prob: torch.Tensor
-            self.action_mean: torch.Tensor | None = None
-            self.action_sigma: torch.Tensor | None = None
+            """Value estimates at the current step (RL only)."""
+
+            self.actions_log_prob: torch.Tensor | None = None
+            """Log probability of the taken actions (RL only)."""
+
+            self.distribution_params: tuple[torch.Tensor, ...] | None = None
+            """Parameters of the action distribution (RL only)."""
+
+            # For distillation
+            self.privileged_actions: torch.Tensor | None = None
+            """Privileged (teacher) actions (distillation only)."""
+
+            # For recurrent networks
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
+            """Hidden states for recurrent networks, e.g., (actor, critic)."""
 
         def clear(self) -> None:
+            """Reset all transition fields to None."""
             self.__init__()
+
+    class Batch:
+        """A batch of data yielded by the rollout storage generators.
+
+        This class provides named access to mini-batch fields. Fields are optional to support different training modes
+        (RL vs distillation) and architectures (feedforward vs recurrent).
+        """
+
+        def __init__(
+            self,
+            observations: TensorDict | None = None,
+            actions: torch.Tensor | None = None,
+            values: torch.Tensor | None = None,
+            advantages: torch.Tensor | None = None,
+            returns: torch.Tensor | None = None,
+            old_actions_log_prob: torch.Tensor | None = None,
+            old_distribution_params: tuple[torch.Tensor, ...] | None = None,
+            hidden_states: tuple[HiddenState, HiddenState] = (None, None),
+            masks: torch.Tensor | None = None,
+            privileged_actions: torch.Tensor | None = None,
+            dones: torch.Tensor | None = None,
+        ) -> None:
+            """Initialize a batch container over rollout data."""
+            self.observations: TensorDict | None = observations
+            """Batch of observations."""
+
+            # For reinforcement learning
+            self.actions: torch.Tensor | None = actions
+            """Batch of actions."""
+
+            self.values: torch.Tensor | None = values
+            """Batch of value estimates (RL only)."""
+
+            self.advantages: torch.Tensor | None = advantages
+            """Batch of advantage estimates (RL only)."""
+
+            self.returns: torch.Tensor | None = returns
+            """Batch of return targets (RL only)."""
+
+            self.old_actions_log_prob: torch.Tensor | None = old_actions_log_prob
+            """Batch of log probabilities of the old actions (RL only)."""
+
+            self.old_distribution_params: tuple[torch.Tensor, ...] | None = old_distribution_params
+            """Batch of parameters of the old action distribution (RL only)."""
+
+            # For distillation
+            self.privileged_actions: torch.Tensor | None = privileged_actions
+            """Batch of privileged (teacher) actions (distillation only)."""
+
+            self.dones: torch.Tensor | None = dones
+            """Batch of done flags (distillation only)."""
+
+            # For recurrent networks
+            self.hidden_states: tuple[HiddenState, HiddenState] = hidden_states
+            """Batch of hidden states for recurrent networks (RL recurrent only)."""
+
+            self.masks: torch.Tensor | None = masks
+            """Batch of trajectory masks for recurrent networks (RL recurrent only)."""
 
     def __init__(
         self,
@@ -62,9 +128,10 @@ class RolloutStorage:
         num_envs: int,
         num_transitions_per_env: int,
         obs: TensorDict,
-        actions_shape: tuple[int] | list[int],
+        actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
     ) -> None:
+        """Allocate rollout buffers for a specific training mode and batch shape."""
         self.training_type = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
@@ -72,7 +139,14 @@ class RolloutStorage:
         self.actions_shape = actions_shape
 
         # Core
-        self.observations = _allocate_rollout_obs_buffer(obs, num_transitions_per_env, device)
+        self.observations = TensorDict(
+            {
+                key: torch.zeros(num_transitions_per_env, *value.shape, dtype=value.dtype, device=device)
+                for key, value in obs.items()
+            },
+            batch_size=[num_transitions_per_env, num_envs],
+            device=self.device,
+        )
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
@@ -85,12 +159,11 @@ class RolloutStorage:
         if training_type == "rl":
             self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
-            self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
-            self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+            self.distribution_params: tuple[torch.Tensor, ...] | None = None  # Lazily initialized on first transition
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
-        # For RNN networks
+        # For recurrent networks
         self.saved_hidden_state_a = None
         self.saved_hidden_state_c = None
 
@@ -98,26 +171,32 @@ class RolloutStorage:
         self.step = 0
 
     def add_transition(self, transition: Transition) -> None:
+        """Add one transition to the storage at the current step index."""
         # Check if the transition is valid
         if self.step >= self.num_transitions_per_env:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
 
         # Core
         self.observations[self.step].copy_(transition.observations)
-        self.actions[self.step].copy_(transition.actions)
+        self.actions[self.step].copy_(transition.actions)  # type: ignore
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # For distillation
         if self.training_type == "distillation":
-            self.privileged_actions[self.step].copy_(transition.privileged_actions)
+            self.privileged_actions[self.step].copy_(transition.privileged_actions)  # type: ignore
 
         # For reinforcement learning
         if self.training_type == "rl":
-            self.values[self.step].copy_(transition.values)
+            self.values[self.step].copy_(transition.values)  # type: ignore
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
-            self.mu[self.step].copy_(transition.action_mean)
-            self.sigma[self.step].copy_(transition.action_sigma)
+            if self.distribution_params is None:  # Initialize the distribution parameters
+                self.distribution_params = tuple(
+                    torch.zeros(self.num_transitions_per_env, *p.shape, device=self.device)
+                    for p in transition.distribution_params  # type: ignore
+                )
+            for i, p in enumerate(transition.distribution_params):  # type: ignore
+                self.distribution_params[i][self.step].copy_(p)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -126,35 +205,39 @@ class RolloutStorage:
         self.step += 1
 
     def clear(self) -> None:
+        """Reset the write cursor for the next rollout."""
         self.step = 0
 
     # For distillation
-    def generator(self) -> Generator:
+    def generator(self) -> Generator[Batch, None, None]:
+        """Yield per-timestep batches for distillation training."""
         if self.training_type != "distillation":
             raise ValueError("This function is only available for distillation training.")
 
         for i in range(self.num_transitions_per_env):
-            yield self.observations[i], self.actions[i], self.privileged_actions[i], self.dones[i]
+            yield RolloutStorage.Batch(
+                observations=self.observations[i],  # type: ignore
+                privileged_actions=self.privileged_actions[i],
+                dones=self.dones[i],
+            )
 
     # For reinforcement learning with feedforward networks
-    def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
+    def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator[Batch, None, None]:
+        """Yield shuffled flat mini-batches for feedforward RL updates."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
-        # Core
+        # Flatten the data
         observations = self.observations.flatten(0, 1)
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
-
-        # For PPO
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
-        old_mu = self.mu.flatten(0, 1)
-        old_sigma = self.sigma.flatten(0, 1)
+        old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -163,47 +246,31 @@ class RolloutStorage:
                 stop = (i + 1) * mini_batch_size
                 batch_idx = indices[start:stop]
 
-                # Create the mini-batch
-                obs_batch = observations[batch_idx]
-                actions_batch = actions[batch_idx]
-                target_values_batch = values[batch_idx]
-                returns_batch = returns[batch_idx]
-                old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
-                advantages_batch = advantages[batch_idx]
-                old_mu_batch = old_mu[batch_idx]
-                old_sigma_batch = old_sigma[batch_idx]
-
-                hidden_state_a_batch = None
-                hidden_state_c_batch = None
-                masks_batch = None
-
                 # Yield the mini-batch
-                yield (
-                    obs_batch,
-                    actions_batch,
-                    target_values_batch,
-                    advantages_batch,
-                    returns_batch,
-                    old_actions_log_prob_batch,
-                    old_mu_batch,
-                    old_sigma_batch,
-                    (
-                        hidden_state_a_batch,
-                        hidden_state_c_batch,
-                    ),
-                    masks_batch,
+                yield RolloutStorage.Batch(
+                    observations=observations[batch_idx],  # type: ignore
+                    actions=actions[batch_idx],
+                    values=values[batch_idx],
+                    advantages=advantages[batch_idx],
+                    returns=returns[batch_idx],
+                    old_actions_log_prob=old_actions_log_prob[batch_idx],
+                    old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
                 )
 
     # For reinforcement learning with recurrent networks
-    def recurrent_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
+    def recurrent_mini_batch_generator(
+        self, num_mini_batches: int, num_epochs: int = 8
+    ) -> Generator[Batch, None, None]:
+        """Yield trajectory mini-batches with masks and recurrent hidden states."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
-
         mini_batch_size = self.num_envs // num_mini_batches
+
         for ep in range(num_epochs):
             first_traj = 0
             for i in range(num_mini_batches):
+                # Select the indices for the mini-batch
                 start = i * mini_batch_size
                 stop = (i + 1) * mini_batch_size
 
@@ -214,77 +281,77 @@ class RolloutStorage:
                 trajectories_batch_size = torch.sum(last_was_done[:, start:stop])
                 last_traj = first_traj + trajectories_batch_size
 
-                masks_batch = trajectory_masks[:, first_traj:last_traj]
-                obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
-                actions_batch = self.actions[:, start:stop]
-                old_mu_batch = self.mu[:, start:stop]
-                old_sigma_batch = self.sigma[:, start:stop]
-                returns_batch = self.returns[:, start:stop]
-                advantages_batch = self.advantages[:, start:stop]
-                values_batch = self.values[:, start:stop]
-                old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
-
+                # Handle the hidden states
                 # Reshape to [num_envs, time, num layers, hidden dim]
                 # Original shape: [time, num_layers, num_envs, hidden_dim])
                 last_was_done = last_was_done.permute(1, 0)
                 # Take only time steps after dones (flattens num envs and time dimensions),
                 # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
-                hidden_state_a_batch = [
-                    saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
-                    .transpose(1, 0)
-                    .contiguous()
-                    for saved_hidden_state in self.saved_hidden_state_a
-                ]
-                hidden_state_c_batch = [
-                    saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
-                    .transpose(1, 0)
-                    .contiguous()
-                    for saved_hidden_state in self.saved_hidden_state_c
-                ]
-                # Remove the tuple for GRU
-                hidden_state_a_batch = (
-                    hidden_state_a_batch[0] if len(hidden_state_a_batch) == 1 else hidden_state_a_batch
-                )
-                hidden_state_c_batch = (
-                    hidden_state_c_batch[0] if len(hidden_state_c_batch) == 1 else hidden_state_c_batch
-                )
+                if self.saved_hidden_state_a is not None:
+                    hidden_state_a_batch = [
+                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                        .transpose(1, 0)
+                        .contiguous()
+                        for saved_hidden_state in self.saved_hidden_state_a
+                    ]
+                    # Unwrap the single state of a GRU, keep the pair of an LSTM as a tuple
+                    hidden_state_a_batch = (
+                        hidden_state_a_batch[0] if len(hidden_state_a_batch) == 1 else tuple(hidden_state_a_batch)
+                    )
+                else:
+                    hidden_state_a_batch = None
+                if self.saved_hidden_state_c is not None:
+                    hidden_state_c_batch = [
+                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                        .transpose(1, 0)
+                        .contiguous()
+                        for saved_hidden_state in self.saved_hidden_state_c
+                    ]
+                    hidden_state_c_batch = (
+                        hidden_state_c_batch[0] if len(hidden_state_c_batch) == 1 else tuple(hidden_state_c_batch)
+                    )
+                else:
+                    hidden_state_c_batch = None
 
                 # Yield the mini-batch
-                yield (
-                    obs_batch,
-                    actions_batch,
-                    values_batch,
-                    advantages_batch,
-                    returns_batch,
-                    old_actions_log_prob_batch,
-                    old_mu_batch,
-                    old_sigma_batch,
-                    (
-                        hidden_state_a_batch,
-                        hidden_state_c_batch,
-                    ),
-                    masks_batch,
+                yield RolloutStorage.Batch(
+                    observations=padded_obs_trajectories[:, first_traj:last_traj],  # type: ignore
+                    actions=self.actions[:, start:stop],
+                    values=self.values[:, start:stop],
+                    advantages=self.advantages[:, start:stop],
+                    returns=self.returns[:, start:stop],
+                    old_actions_log_prob=self.actions_log_prob[:, start:stop],
+                    old_distribution_params=tuple(p[:, start:stop] for p in self.distribution_params),  # type: ignore
+                    hidden_states=(hidden_state_a_batch, hidden_state_c_batch),  # type: ignore
+                    masks=trajectory_masks[:, first_traj:last_traj],
                 )
 
                 first_traj = last_traj
 
     def _save_hidden_states(self, hidden_states: tuple[HiddenState, HiddenState]) -> None:
+        """Save recurrent hidden states to the rollout storage."""
         if hidden_states == (None, None):
             return
         # Make a tuple out of GRU hidden states to match the LSTM format
-        hidden_state_a = hidden_states[0] if isinstance(hidden_states[0], tuple) else (hidden_states[0],)
-        hidden_state_c = hidden_states[1] if isinstance(hidden_states[1], tuple) else (hidden_states[1],)
+        if hidden_states[0] is not None:
+            hidden_state_a = hidden_states[0] if isinstance(hidden_states[0], tuple) else (hidden_states[0],)
+        if hidden_states[1] is not None:
+            hidden_state_c = hidden_states[1] if isinstance(hidden_states[1], tuple) else (hidden_states[1],)
         # Initialize hidden states if needed
-        if self.saved_hidden_state_a is None:
+        if self.saved_hidden_state_a is None and hidden_states[0] is not None:
             self.saved_hidden_state_a = [
                 torch.zeros(self.observations.shape[0], *hidden_state_a[i].shape, device=self.device)
                 for i in range(len(hidden_state_a))
             ]
+        if self.saved_hidden_state_c is None and hidden_states[1] is not None:
             self.saved_hidden_state_c = [
                 torch.zeros(self.observations.shape[0], *hidden_state_c[i].shape, device=self.device)
                 for i in range(len(hidden_state_c))
             ]
         # Copy the states
-        for i in range(len(hidden_state_a)):
-            self.saved_hidden_state_a[i][self.step].copy_(hidden_state_a[i])
-            self.saved_hidden_state_c[i][self.step].copy_(hidden_state_c[i])
+        if hidden_states[0] is not None:
+            for i in range(len(hidden_state_a)):
+                self.saved_hidden_state_a[i][self.step].copy_(hidden_state_a[i])  # type: ignore
+        if hidden_states[1] is not None:
+            for i in range(len(hidden_state_c)):
+                self.saved_hidden_state_c[i][self.step].copy_(hidden_state_c[i])  # type: ignore

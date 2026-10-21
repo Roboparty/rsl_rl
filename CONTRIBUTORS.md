@@ -30,13 +30,20 @@ Please keep the lists sorted alphabetically.
 ## Contributors
 
 * Bikram Pandit
+* Emilio Palma
 * Eric Vollenweider
 * Fabian Jenelten
+* Jichuan Hu
+* Kohei Sendai
 * Lorenzo Terenzi
 * Marko Bjelonic
+* Markus Portugall
+* Masahiro Kubota
 * Matthijs van der Boon
 * Özhan Özen
 * Pascal Roth
 * Shaoshu Su
+* Shiqi Ren
+* Zeng Qingcheng
 * Zhang Chong
 * Ziqi Fan

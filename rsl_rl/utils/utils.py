@@ -3,12 +3,15 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+
 from __future__ import annotations
 
+import copy
 import importlib
 import pkgutil
 import torch
 import warnings
+from collections.abc import Iterable
 from tensordict import TensorDict
 from typing import Any, Callable
 
@@ -30,6 +33,9 @@ def get_param(param: Any, idx: int) -> Any:
 
 def resolve_nn_activation(act_name: str) -> torch.nn.Module:
     """Resolve the activation function from the name.
+
+    Valid activation function names are: ``"elu"``, ``"selu"``, ``"relu"``, ``"crelu"``, ``"lrelu"``, ``"tanh"``,
+    ``"sigmoid"``, ``"softplus"``, ``"gelu"``, ``"swish"``, ``"mish"``, ``"identity"``.
 
     Args:
         act_name: Name of the activation function.
@@ -65,6 +71,8 @@ def resolve_nn_activation(act_name: str) -> torch.nn.Module:
 def resolve_optimizer(optimizer_name: str) -> torch.optim.Optimizer:
     """Resolve the optimizer from the name.
 
+    Valid optimizer names are: ``"adam"``, ``"adamw"``, ``"sgd"``, ``"rmsprop"``.
+
     Args:
         optimizer_name: Name of the optimizer.
 
@@ -88,82 +96,15 @@ def resolve_optimizer(optimizer_name: str) -> torch.optim.Optimizer:
         raise ValueError(f"Invalid optimizer '{optimizer_name}'. Valid optimizers are: {list(optimizer_dict.keys())}")
 
 
-def split_and_pad_trajectories(
-    tensor: torch.Tensor | TensorDict, dones: torch.Tensor
-) -> tuple[torch.Tensor | TensorDict, torch.Tensor]:
-    """Split trajectories at done indices.
-
-    Split trajectories, concatenate them and pad with zeros up to the length of the longest trajectory. Return masks
-    corresponding to valid parts of the trajectories.
-
-    Example (transposed for readability):
-        Input: [[a1, a2, a3, a4 | a5, a6],
-                 [b1, b2 | b3, b4, b5 | b6]]
-
-        Output:[[a1, a2, a3, a4], | [[True, True, True, True],
-                [a5, a6, 0, 0],   |  [True, True, False, False],
-                [b1, b2, 0, 0],   |  [True, True, False, False],
-                [b3, b4, b5, 0],  |  [True, True, True, False],
-                [b6, 0, 0, 0]]    |  [True, False, False, False]]
-
-    Assumes that the input has the following order of dimensions: [time, number of envs, additional dimensions]
-    """
-    dones = dones.clone()
-    dones[-1] = 1
-    # Permute the buffers to have the order (num_envs, num_transitions_per_env, ...) for correct reshaping
-    flat_dones = dones.transpose(1, 0).reshape(-1, 1)
-    # Get length of trajectory by counting the number of successive not done elements
-    done_indices = torch.cat((flat_dones.new_tensor([-1], dtype=torch.int64), flat_dones.nonzero()[:, 0]))
-    trajectory_lengths = done_indices[1:] - done_indices[:-1]
-    trajectory_lengths_list = trajectory_lengths.tolist()
-    # Extract the individual trajectories
-    if isinstance(tensor, TensorDict):
-        padded_trajectories = {}
-        for k, v in tensor.items():
-            # Split the tensor into trajectories
-            trajectories = torch.split(v.transpose(1, 0).flatten(0, 1), trajectory_lengths_list)
-            # Add at least one full length trajectory
-            trajectories = (*trajectories, torch.zeros(v.shape[0], *v.shape[2:], device=v.device))
-            # Pad the trajectories to the length of the longest trajectory
-            padded_trajectories[k] = torch.nn.utils.rnn.pad_sequence(trajectories)  # type: ignore
-            # Remove the added trajectory
-            padded_trajectories[k] = padded_trajectories[k][:, :-1]
-        padded_trajectories = TensorDict(
-            padded_trajectories, batch_size=[tensor.batch_size[0], len(trajectory_lengths_list)], device=tensor.device
-        )
-    else:
-        # Split the tensor into trajectories
-        trajectories = torch.split(tensor.transpose(1, 0).flatten(0, 1), trajectory_lengths_list)
-        # Add at least one full length trajectory
-        trajectories = (*trajectories, torch.zeros(tensor.shape[0], *tensor.shape[2:], device=tensor.device))
-        # Pad the trajectories to the length of the longest trajectory
-        padded_trajectories = torch.nn.utils.rnn.pad_sequence(trajectories)  # type: ignore
-        # Remove the added trajectory
-        padded_trajectories = padded_trajectories[:, :-1]
-    # Create masks for the valid parts of the trajectories
-    trajectory_masks = trajectory_lengths > torch.arange(0, tensor.shape[0], device=tensor.device).unsqueeze(1)
-    return padded_trajectories, trajectory_masks
-
-
-def unpad_trajectories(trajectories: torch.Tensor | TensorDict, masks: torch.Tensor) -> torch.Tensor | TensorDict:
-    """Do the inverse operation of `split_and_pad_trajectories()`."""
-    # Need to transpose before and after the masking to have proper reshaping
-    return (
-        trajectories.transpose(1, 0)[masks.transpose(1, 0)]
-        .view(-1, trajectories.shape[0], trajectories.shape[-1])
-        .transpose(1, 0)
-    )
-
-
 def resolve_callable(callable_or_name: type | Callable | str) -> Callable:
     """Resolve a callable from a string, type, or return callable directly.
 
-    This function enables passing custom classes or functions directly or as strings. The following formats are
-    supported:
-        - Direct callable: Pass a type or function directly (e.g., MyClass, my_func)
-        - Qualified name with colon: "module.path:Attr.Nested" (explicit, recommended)
-        - Qualified name with dot: "module.path.ClassName" (implicit)
-        - Simple name: e.g. "PPO", "ActorCritic", ... (looks for callable in rsl_rl)
+    This function supports resolving callables from a direct callable input or from a string in one of these formats:
+
+    - Direct callable: pass a type or function directly (for example, ``MyClass`` or ``my_func``).
+    - Qualified name with colon: ``"module.path:Attr.Nested"`` (explicit, recommended).
+    - Qualified name with dot: ``"module.path.ClassName"`` (implicit).
+    - Simple name: for example ``"PPO"`` or ``"ActorCritic"`` (searched within ``rsl_rl``).
 
     Args:
         callable_or_name: A callable (type/function) or string name.
@@ -235,6 +176,19 @@ def resolve_callable(callable_or_name: type | Callable | str) -> Callable:
     )
 
 
+def resolve_class(cfg: dict) -> tuple[Callable, dict]:
+    """Resolve the class referenced by ``cfg["class_name"]`` without mutating ``cfg``.
+
+    Args:
+        cfg: Configuration dictionary with a ``"class_name"`` key and the constructor arguments of that class.
+
+    Returns:
+        The resolved class and a deep copy of ``cfg`` with ``"class_name"`` removed.
+    """
+    class_cfg = copy.deepcopy(cfg)
+    return resolve_callable(class_cfg.pop("class_name")), class_cfg
+
+
 def resolve_obs_groups(
     obs: TensorDict, obs_groups: dict[str, list[str]], default_sets: list[str]
 ) -> dict[str, list[str]]:
@@ -243,28 +197,30 @@ def resolve_obs_groups(
     The input is an observation dictionary `obs` containing observation groups and a configuration dictionary
     `obs_groups` where the keys are the observation sets and the values are lists of observation groups.
 
-    The configuration dictionary could for example look like:
+    The configuration dictionary could for example look like::
+
         {
-            "policy": ["group_1", "group_2"],
-            "critic": ["group_1", "group_3"]
+            "actor": ["group_1", "group_2"],
+            "critic": ["group_1", "group_3"],
         }
 
-    This means that the 'policy' observation set will contain the observations "group_1" and "group_2" and the 'critic'
+    This means that the 'actor' observation set will contain the observations "group_1" and "group_2" and the 'critic'
     observation set will contain the observations "group_1" and "group_3". This function will check that all the
-    observations in the 'policy' and 'critic' observation sets are present in the observation dictionary from the
+    observations in the 'actor' and 'critic' observation sets are present in the observation dictionary from the
     environment.
 
     Additionally, if one of the `default_sets`, e.g. "critic", is not present in the configuration dictionary, this
     function will:
 
     1. Check if a group with the same name exists in the observations and assign this group to the observation set.
-    2. If 1. fails, it will assign the observations from the 'policy' observation set to the default observation set.
+    2. If 1. fails, it will assign the 'policy' observation group to the missing observation set.
+    3. If 2. fails, an error is raised.
 
     Args:
         obs: Observations from the environment in the form of a dictionary.
-        obs_groups: Observation sets configuration.
-        default_sets: Reserved observation set names used by the algorithm (besides 'policy'). If not provided in
-            'obs_groups', a default behavior gets triggered.
+        obs_groups: Dictionary mapping observation sets to lists of observation groups.
+        default_sets: Default observation set names used by the algorithm. If not provided in ``obs_groups``, a
+            default behavior gets triggered.
 
     Returns:
         The resolved observation groups.
@@ -272,43 +228,27 @@ def resolve_obs_groups(
     Raises:
         ValueError: If any observation set is an empty list.
         ValueError: If any observation set contains an observation term that is not present in the observations.
+        ValueError: If a default observation set cannot be resolved according to the rules above.
     """
-    # Check if policy observation set exists
-    if "policy" not in obs_groups:
-        if "policy" in obs:
-            obs_groups["policy"] = ["policy"]
-            warnings.warn(
-                "The observation configuration dictionary 'obs_groups' must contain the 'policy' key."
-                " As an observation group with the name 'policy' was found, this is assumed to be the observation set."
-                " Consider adding the 'policy' key to the 'obs_groups' dictionary for clarity."
-                " This behavior will be removed in a future version."
-            )
-        else:
-            raise ValueError(
-                "The observation configuration dictionary 'obs_groups' must contain the 'policy' key."
-                f" Found keys: {list(obs_groups.keys())}"
-            )
-
-    # Check all observation sets for valid observation groups
-    for set_name, groups in obs_groups.items():
-        # Check if the list is empty
-        if len(groups) == 0:
-            msg = f"The '{set_name}' key in the 'obs_groups' dictionary can not be an empty list."
-            if set_name in default_sets:
-                if set_name not in obs:
-                    msg += " Consider removing the key to default to the observations used for the 'policy' set."
-                else:
-                    msg += (
-                        f" Consider removing the key to default to the observation '{set_name}' from the environment."
+    # Check if obs_groups dictionary is empty
+    if len(obs_groups) == 0:
+        warnings.warn(
+            "The observation configuration dictionary 'obs_groups' is empty and thus likely not configured. Consider"
+            " configuring the 'obs_groups' dictionary explicitly"
+        )
+    else:
+        # Check all observation sets for valid observation groups
+        for set_name, groups in obs_groups.items():
+            # Check if the list is empty
+            if len(groups) == 0:
+                raise ValueError(f"The '{set_name}' key in the 'obs_groups' dictionary can not be an empty list.")
+            # Check groups exist inside the observations from the environment
+            for group in groups:
+                if group not in obs:
+                    raise ValueError(
+                        f"Observation '{group}' in observation set '{set_name}' not found in the observations from the"
+                        f" environment. Available observations from the environment: {list(obs.keys())}"
                     )
-            raise ValueError(msg)
-        # Check groups exist inside the observations from the environment
-        for group in groups:
-            if group not in obs:
-                raise ValueError(
-                    f"Observation '{group}' in observation set '{set_name}' not found in the observations from the"
-                    f" environment. Available observations from the environment: {list(obs.keys())}"
-                )
 
     # Fill missing observation sets
     for default_set_name in default_sets:
@@ -316,18 +256,25 @@ def resolve_obs_groups(
             if default_set_name in obs:
                 obs_groups[default_set_name] = [default_set_name]
                 warnings.warn(
-                    f"The observation configuration dictionary 'obs_groups' must contain the '{default_set_name}' key."
-                    f" As an observation group with the name '{default_set_name}' was found, this is assumed to be the"
-                    f" observation set. Consider adding the '{default_set_name}' key to the 'obs_groups' dictionary for"
-                    " clarity. This behavior will be removed in a future version."
+                    f"The observation configuration dictionary 'obs_groups' does not contain the '{default_set_name}'"
+                    f" key. As an observation group with the name '{default_set_name}' was found, this is assumed to be"
+                    f" the appropriate observation. Consider adding the '{default_set_name}' key to the 'obs_groups'"
+                    f" dictionary for clarity. This behavior will be removed in a future version."
+                )
+            elif "policy" in obs:
+                obs_groups[default_set_name] = ["policy"]
+                warnings.warn(
+                    f"The observation configuration dictionary 'obs_groups' does not contain the '{default_set_name}'"
+                    f" key. As an observation group with the name 'policy' was found, this is assumed to be the"
+                    f" appropriate observation. Consider adding the '{default_set_name}' key to the 'obs_groups'"
+                    f" dictionary for clarity. This behavior will be removed in a future version."
                 )
             else:
-                obs_groups[default_set_name] = obs_groups["policy"].copy()
-                warnings.warn(
-                    f"The observation configuration dictionary 'obs_groups' must contain the '{default_set_name}' key."
-                    f" As the configuration for '{default_set_name}' is missing, the observations from the 'policy' set"
-                    f" are used. Consider adding the '{default_set_name}' key to the 'obs_groups' dictionary for"
-                    " clarity. This behavior will be removed in a future version."
+                raise ValueError(
+                    f"The observation configuration dictionary 'obs_groups' does not contain the '{default_set_name}'"
+                    f" key and no suitable observation could be found in the observations from the environment."
+                    f" Please refer to `rsl_rl.utils.resolve_obs_groups()` for information on how to configure the"
+                    f" 'obs_groups' dictionary correctly."
                 )
 
     # Print the final parsed observation sets
@@ -338,3 +285,170 @@ def resolve_obs_groups(
     print("-" * 80)
 
     return obs_groups
+
+
+def check_nan(obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor) -> None:
+    """Raise ``ValueError`` if any environment output contains NaN."""
+    for key, tensor in obs.items():
+        if torch.isnan(tensor).any():
+            raise ValueError(
+                f"The observation group '{key}' returned by the environment contains NaN values. This usually indicates"
+                " a bug in the environment's step() or reset() function."
+            )
+    if torch.isnan(rewards).any():
+        raise ValueError(
+            "The rewards returned by the environment contain NaN values. This usually indicates a bug in the"
+            " environment's reward computation."
+        )
+    if torch.isnan(dones).any():
+        raise ValueError(
+            "The dones returned by the environment contain NaN values. This usually indicates a bug in the"
+            " environment's termination logic."
+        )
+
+
+def compile_model(model: torch.nn.Module, mode: str | None = None) -> torch.nn.Module:
+    """Wrap a model with :func:`torch.compile`, validating the compile mode.
+
+    Args:
+        model: The model to compile.
+        mode: The :func:`torch.compile` mode. CUDA-graph modes (``"reduce-overhead"``, ``"max-autotune"``) are rejected
+        because they are incompatible with the multi-model forward patterns used by the algorithms (graph replay
+        overwrites the previous call's output buffer). Use ``"default"`` or ``"max-autotune-no-cudagraphs"`` instead.
+        Defaults to ``None``, in which case compilation is disabled.
+
+    Returns:
+        The compiled model, or the original model if ``mode`` is ``None``.
+
+    Raises:
+        ValueError: If ``mode`` is one of the unsupported CUDA-graph modes.
+    """
+    if mode is None:
+        return model
+    if mode in ("reduce-overhead", "max-autotune"):
+        raise ValueError(
+            f"torch_compile_mode='{mode}' uses CUDA graphs which are incompatible with the algorithms' multi-model "
+            f"forward pattern. Use 'default' or 'max-autotune-no-cudagraphs', or set to None to disable."
+        )
+    return torch.compile(model, mode=mode)  # type: ignore
+
+
+def reduce_gradients_in_buckets(params: Iterable[torch.nn.Parameter], world_size: int, bucket_mb: float) -> None:
+    """Average gradients across GPUs in bounded-size buckets.
+
+    Gradients are packed into buffers of at most ``bucket_mb`` and reduced with a single
+    ``all_reduce`` call per buffer. A gradient larger than the bucket on its own is reduced in
+    contiguous slices instead. This bounds the size of the temporary packed buffer while still
+    batching small gradients together to limit the number of collective calls.
+
+    Args:
+        params: Parameters whose gradients should be reduced. Parameters with no gradient are skipped.
+        world_size: Number of distributed processes to average the summed gradients over.
+        bucket_mb: Maximum size, in megabytes, of a single packed buffer.
+    """
+    bucket_bytes = int(bucket_mb * 1024 * 1024)
+    grads = [param.grad.view(-1) for param in params if param.grad is not None]
+    start = 0
+    while start < len(grads):
+        nbytes = grads[start].numel() * grads[start].element_size()
+        if nbytes > bucket_bytes:
+            # A single gradient larger than the bucket is reduced in contiguous slices
+            flat_grad = grads[start]
+            chunk_numel = max(1, bucket_bytes // flat_grad.element_size())
+            for offset in range(0, flat_grad.numel(), chunk_numel):
+                chunk = flat_grad.narrow(0, offset, min(chunk_numel, flat_grad.numel() - offset))
+                torch.distributed.all_reduce(chunk, op=torch.distributed.ReduceOp.SUM)
+                chunk /= world_size
+            start += 1
+            continue
+
+        filled_bytes = 0
+        end = start
+        while end < len(grads):
+            # A smaller gradient is packed with others until the bucket is full
+            grad_bytes = grads[end].numel() * grads[end].element_size()
+            if filled_bytes + grad_bytes > bucket_bytes:
+                break
+            filled_bytes += grad_bytes
+            end += 1
+
+        packed = torch.cat(grads[start:end])
+        torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+        packed /= world_size
+        offset = 0
+        for flat_grad in grads[start:end]:
+            numel = flat_grad.numel()
+            flat_grad.copy_(packed[offset : offset + numel])
+            offset += numel
+        start = end
+
+
+def split_and_pad_trajectories(
+    tensor: torch.Tensor | TensorDict, dones: torch.Tensor
+) -> tuple[torch.Tensor | TensorDict, torch.Tensor]:
+    """Split trajectories at done indices.
+
+    Split trajectories, concatenate them and pad with zeros up to the length of the longest trajectory. Return masks
+    corresponding to valid parts of the trajectories.
+
+    Example (transposed for readability):
+        Input: [[a1, a2, a3, a4 | a5, a6],
+                [b1, b2 | b3, b4, b5 | b6]]
+
+        Output:[[a1, a2, a3, a4], | [[True, True, True, True],
+                [a5, a6, 0, 0],   |  [True, True, False, False],
+                [b1, b2, 0, 0],   |  [True, True, False, False],
+                [b3, b4, b5, 0],  |  [True, True, True, False],
+                [b6, 0, 0, 0]]    |  [True, False, False, False]]
+
+    Assumes that the input has the following order of dimensions: [time, number of envs, additional dimensions]
+    """
+    dones = dones.clone()
+    dones[-1] = 1
+    # Permute the buffers to have the order (num_envs, num_transitions_per_env, ...) for correct reshaping
+    flat_dones = dones.transpose(1, 0).reshape(-1, 1)
+    # Get length of trajectory by counting the number of successive not done elements
+    done_indices = torch.cat((flat_dones.new_tensor([-1], dtype=torch.int64), flat_dones.nonzero()[:, 0]))
+    trajectory_lengths = done_indices[1:] - done_indices[:-1]
+    trajectory_lengths_list = trajectory_lengths.tolist()
+    # Extract the individual trajectories
+    if isinstance(tensor, TensorDict):
+        padded_trajectories = {}
+        for k, v in tensor.items():
+            # Split the tensor into trajectories
+            trajectories = torch.split(v.transpose(1, 0).flatten(0, 1), trajectory_lengths_list)
+            # Add at least one full length trajectory
+            trajectories = (*trajectories, torch.zeros(v.shape[0], *v.shape[2:], device=v.device))
+            # Pad the trajectories to the length of the longest trajectory
+            padded_trajectories[k] = torch.nn.utils.rnn.pad_sequence(trajectories)  # type: ignore
+            # Remove the added trajectory
+            padded_trajectories[k] = padded_trajectories[k][:, :-1]
+        padded_trajectories = TensorDict(
+            padded_trajectories, batch_size=[tensor.batch_size[0], len(trajectory_lengths_list)], device=tensor.device
+        )
+    else:
+        # Split the tensor into trajectories
+        trajectories = torch.split(tensor.transpose(1, 0).flatten(0, 1), trajectory_lengths_list)
+        # Add at least one full length trajectory
+        trajectories = (*trajectories, torch.zeros(tensor.shape[0], *tensor.shape[2:], device=tensor.device))
+        # Pad the trajectories to the length of the longest trajectory
+        padded_trajectories = torch.nn.utils.rnn.pad_sequence(trajectories)  # type: ignore
+        # Remove the added trajectory
+        padded_trajectories = padded_trajectories[:, :-1]
+    # Create masks for the valid parts of the trajectories
+    trajectory_masks = trajectory_lengths > torch.arange(0, tensor.shape[0], device=tensor.device).unsqueeze(1)
+    return padded_trajectories, trajectory_masks
+
+
+def unpad_trajectories(trajectories: torch.Tensor | TensorDict, masks: torch.Tensor) -> torch.Tensor | TensorDict:
+    """Do the inverse operation of `split_and_pad_trajectories()`."""
+    # Select valid steps and flatten to sequence of valid steps
+    valid_steps = trajectories.transpose(1, 0)[masks.transpose(1, 0)]
+    # Reshape back to original dimensions
+    if isinstance(trajectories, TensorDict):
+        # TensorDict.view() only modifies the batch size.
+        # We reshape [valid_steps] -> [number of envs, time] and then transpose back to [time, number of envs]
+        return valid_steps.view(-1, trajectories.shape[0]).transpose(1, 0)
+    else:
+        # For standard Tensors, we must explicitly handle feature dimensions in view()
+        return valid_steps.view(-1, trajectories.shape[0], *trajectories.shape[2:]).transpose(1, 0)
