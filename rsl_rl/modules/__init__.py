@@ -10,6 +10,8 @@ from .distribution import BetaDistribution, Distribution, GaussianDistribution, 
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 from .rnn import RNN, HiddenState
+from .amp import AMPDiscriminator, LossType, resolve_amp_config
+from .moe import MoeLayer
 
 __all__ = [
     "CNN",
@@ -22,4 +24,8 @@ __all__ = [
     "GaussianDistribution",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
+    "AMPDiscriminator",
+    "LossType",
+    "resolve_amp_config",
+    "MoeLayer",
 ]
