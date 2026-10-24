@@ -5,16 +5,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from rsl_rl.utils import resolve_nn_activation
-
-if TYPE_CHECKING:
-    from tensordict import TensorDict
 
 
 class MoeLayer(nn.Module):
@@ -81,18 +76,3 @@ class MoeLayer(nn.Module):
         gate_scores = self.gate_scores(x)
         expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)
         return torch.einsum("be,beo->bo", gate_scores, expert_outputs)
-
-
-def collect_actor_moe_gate_log(policy, obs: TensorDict) -> dict[str, float]:
-    """Return actor MoE gate statistics for logging (empty dict if policy is not MoE)."""
-    actor = getattr(policy, "actor", None)
-    if not isinstance(actor, MoeLayer):
-        return {}
-    if not hasattr(policy, "get_actor_obs"):
-        return {}
-    with torch.no_grad():
-        actor_obs = policy.get_actor_obs(obs)
-        if hasattr(policy, "actor_obs_normalizer"):
-            actor_obs = policy.actor_obs_normalizer(actor_obs)
-        stats = actor.gate_stats(actor_obs)
-    return {f"moe/actor/{key}": value for key, value in stats.items()}

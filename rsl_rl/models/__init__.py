@@ -8,9 +8,12 @@
 from .cnn_model import CNNModel
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
+from .encoder_model import EncoderModel, EncoderMoEModel
 
 __all__ = [
     "CNNModel",
     "MLPModel",
     "RNNModel",
+    "EncoderModel",
+    "EncoderMoEModel",
 ]
