@@ -11,6 +11,7 @@ import torch.nn as nn
 from tensordict import TensorDict
 
 from rsl_rl.models.cnn_model import CNNModel
+from rsl_rl.models.mlp_model import MLPModel
 from rsl_rl.modules import MLP
 from rsl_rl.modules.moe import MoeLayer
 from rsl_rl.utils import resolve_nn_activation
@@ -31,8 +32,18 @@ class Conv2dHeadModel(nn.Module):
         nonlinearity: str = "ReLU",
         use_maxpool: bool = False,
         last_activation: str | None = None,
+        input_dtype: str | None = None,
+        input_range: tuple[float, float] = (0.0, 255.0),
     ) -> None:
         super().__init__()
+        self.input_dtype = input_dtype
+        self.input_range = tuple(input_range)
+        if input_dtype not in (None, "uint8", "float32"):
+            raise ValueError("Encoder input_dtype must be uint8 or float32.")
+        if len(input_range) != 2 or input_range[0] >= input_range[1]:
+            raise ValueError("Encoder input_range must be increasing.")
+        if input_dtype == "uint8" and self.input_range != (0.0, 255.0):
+            raise ValueError("uint8 depth inputs must declare input_range=(0, 255).")
         paddings = [0] * len(channels) if paddings is None else paddings
         if not len(channels) == len(kernel_sizes) == len(strides) == len(paddings):
             raise ValueError("Encoder channels, kernels, strides and paddings must have the same length.")
@@ -56,6 +67,14 @@ class Conv2dHeadModel(nn.Module):
         self.output_channels = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.input_dtype == "uint8" and x.dtype != torch.uint8:
+            raise TypeError("Depth encoder expects uint8 input in [0, 255].")
+        if self.input_dtype == "float32":
+            if x.dtype != torch.float32:
+                raise TypeError("Depth encoder expects float32 input.")
+            x = (x - self.input_range[0]) / (self.input_range[1] - self.input_range[0])
+        if x.dtype == torch.uint8:
+            x = x.float().div(255.0)
         return self.head(self.conv(x).flatten(start_dim=1))
 
 
