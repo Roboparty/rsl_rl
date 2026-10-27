@@ -130,6 +130,9 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
+        compact_depth_history: bool = False,
+        depth_history_offsets: tuple[int, ...] | list[int] = (),
+        depth_observation_key: tuple[str, ...] = ("depth",),
     ) -> None:
         """Allocate rollout buffers for a specific training mode and batch shape."""
         self.training_type = training_type
@@ -137,6 +140,28 @@ class RolloutStorage:
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
+        self.compact_depth_history = compact_depth_history
+        self.depth_history_offsets = tuple(depth_history_offsets) if compact_depth_history else ()
+        self.depth_observation_key = tuple(depth_observation_key)
+
+        if compact_depth_history:
+            offsets = self.depth_history_offsets
+            if (
+                not offsets
+                or offsets[-1] != 0
+                or any(type(offset) is not int or offset < 0 for offset in offsets)
+                or any(older <= newer for older, newer in zip(offsets, offsets[1:]))
+            ):
+                raise ValueError("Depth history offsets must be descending nonnegative integers ending in zero")
+            depth = obs.get(self.depth_observation_key)
+            if depth is None:
+                raise KeyError(f"Missing compact depth observation at {self.depth_observation_key!r}")
+            if depth.ndim != 4 or depth.shape[0] != num_envs or depth.shape[1] != len(offsets):
+                raise ValueError(
+                    "Compact rollout requires depth [env, frames, height, width] matching the configured offsets"
+                )
+            if depth.dtype != torch.uint8:
+                raise ValueError("Compact rollout requires uint8 depth observations")
 
         # Core
         self.observations = TensorDict(
@@ -147,6 +172,25 @@ class RolloutStorage:
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )
+        if self.compact_depth_history:
+            depth = obs.get(self.depth_observation_key)
+            compact_shape = (num_transitions_per_env, num_envs, *depth.shape[2:])
+            self.observations.set(
+                self.depth_observation_key,
+                torch.zeros(compact_shape, dtype=depth.dtype, device=device),
+            )
+            max_offset = self.depth_history_offsets[0]
+            self._depth_offsets = torch.tensor(self.depth_history_offsets, device=device)
+            self._depth_lookback = torch.arange(max_offset + 1, device=device)
+            prefix_shape = (max_offset, num_envs, *depth.shape[2:])
+            self._depth_prefix = torch.zeros(prefix_shape, dtype=depth.dtype, device=device)
+            if max_offset:
+                self._depth_prefix.copy_(depth[:, -1].unsqueeze(0).expand_as(self._depth_prefix))
+            self._depth_episode_start = torch.zeros(
+                num_transitions_per_env, num_envs, dtype=torch.bool, device=device
+            )
+            self._depth_start_prefix = torch.zeros(max_offset, num_envs, dtype=torch.bool, device=device)
+            self._next_depth_episode_start = torch.ones(num_envs, dtype=torch.bool, device=device)
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
@@ -177,7 +221,12 @@ class RolloutStorage:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
 
         # Core
-        self.observations[self.step].copy_(transition.observations)
+        if self.compact_depth_history:
+            self._copy_compact_observations(self.observations[self.step], transition.observations)
+            self._depth_episode_start[self.step].copy_(self._next_depth_episode_start)
+            self._next_depth_episode_start.copy_(transition.dones.reshape(self.num_envs, -1).bool().any(dim=-1))
+        else:
+            self.observations[self.step].copy_(transition.observations)
         self.actions[self.step].copy_(transition.actions)  # type: ignore
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
@@ -206,6 +255,18 @@ class RolloutStorage:
 
     def clear(self) -> None:
         """Reset the write cursor for the next rollout."""
+        if self.compact_depth_history and self.depth_history_offsets[0]:
+            depth = self.observations.get(self.depth_observation_key)[: self.step]
+            starts = self._depth_episode_start[: self.step]
+            prefix_length = len(self._depth_prefix)
+            if self.step >= prefix_length:
+                self._depth_prefix.copy_(depth[-prefix_length:])
+                self._depth_start_prefix.copy_(starts[-prefix_length:])
+            elif self.step:
+                self._depth_prefix[:-self.step].copy_(self._depth_prefix[self.step:].clone())
+                self._depth_prefix[-self.step:].copy_(depth)
+                self._depth_start_prefix[:-self.step].copy_(self._depth_start_prefix[self.step:].clone())
+                self._depth_start_prefix[-self.step:].copy_(starts)
         self.step = 0
 
     # For distillation
@@ -215,8 +276,13 @@ class RolloutStorage:
             raise ValueError("This function is only available for distillation training.")
 
         for i in range(self.num_transitions_per_env):
+            observations = self.observations[i].clone()
+            if self.compact_depth_history:
+                time_idx = torch.full((self.num_envs,), i, device=self.device, dtype=torch.long)
+                env_idx = torch.arange(self.num_envs, device=self.device)
+                observations = self._restore_depth(observations, time_idx, env_idx)
             yield RolloutStorage.Batch(
-                observations=self.observations[i],  # type: ignore
+                observations=observations,  # type: ignore
                 privileged_actions=self.privileged_actions[i],
                 dones=self.dones[i],
             )
@@ -238,6 +304,11 @@ class RolloutStorage:
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
+        depth_starts = (
+            torch.cat((self._depth_start_prefix, self._depth_episode_start), dim=0)
+            if self.compact_depth_history
+            else None
+        )
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -247,8 +318,16 @@ class RolloutStorage:
                 batch_idx = indices[start:stop]
 
                 # Yield the mini-batch
+                batch_observations = observations[batch_idx]
+                if self.compact_depth_history:
+                    time_idx = torch.div(batch_idx, self.num_envs, rounding_mode="floor")
+                    env_idx = batch_idx % self.num_envs
+                    batch_observations = self._restore_depth(
+                        batch_observations, time_idx, env_idx, starts=depth_starts
+                    )
+
                 yield RolloutStorage.Batch(
-                    observations=observations[batch_idx],  # type: ignore
+                    observations=batch_observations,  # type: ignore
                     actions=actions[batch_idx],
                     values=values[batch_idx],
                     advantages=advantages[batch_idx],
@@ -264,7 +343,8 @@ class RolloutStorage:
         """Yield trajectory mini-batches with masks and recurrent hidden states."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
-        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
+        observations = self._restore_all_depth() if self.compact_depth_history else self.observations
+        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(observations, self.dones)
         mini_batch_size = self.num_envs // num_mini_batches
 
         for ep in range(num_epochs):
@@ -327,6 +407,72 @@ class RolloutStorage:
                 )
 
                 first_traj = last_traj
+
+
+    def _copy_compact_observations(
+        self, destination: TensorDict, source: TensorDict, prefix: tuple[str, ...] = ()
+    ) -> None:
+        """Copy observations while retaining only the newest depth frame."""
+        for key, source_value in source.items():
+            path = (*prefix, key)
+            destination_value = destination.get(key)
+            if isinstance(source_value, TensorDict):
+                self._copy_compact_observations(destination_value, source_value, path)
+            elif path == self.depth_observation_key:
+                if source_value.ndim != 4 or source_value.shape[1] != len(self.depth_history_offsets):
+                    raise ValueError(
+                        "Compact rollout requires depth [env, frames, height, width] matching the configured offsets"
+                    )
+                if source_value.dtype != torch.uint8:
+                    raise ValueError("Compact rollout requires uint8 depth observations")
+                destination_value.copy_(source_value[:, -1])
+            else:
+                destination_value.copy_(source_value)
+
+    def _restore_depth(
+        self,
+        observations: TensorDict,
+        time_idx: torch.Tensor,
+        env_idx: torch.Tensor,
+        *,
+        starts: torch.Tensor | None = None,
+    ) -> TensorDict:
+        """Rebuild depth stacks for selected rollout time/environment pairs."""
+        max_offset = self.depth_history_offsets[0]
+        depth = self.observations.get(self.depth_observation_key)
+        if starts is None:
+            starts = torch.cat((self._depth_start_prefix, self._depth_episode_start), dim=0)
+        base = time_idx + max_offset
+        lookback = self._depth_lookback
+        history_starts = starts[base[:, None] - lookback, env_idx[:, None]]
+        # Camera history repeats the first post-reset frame instead of crossing an episode boundary.
+        nearest_start = torch.where(history_starts, lookback, max_offset).amin(dim=1)
+        source = base[:, None] - torch.minimum(self._depth_offsets, nearest_start[:, None])
+        source_env = env_idx[:, None].expand_as(source)
+        prefix_mask = source < max_offset
+        restored_depth = torch.empty(
+            *source.shape, *depth.shape[2:], dtype=depth.dtype, device=depth.device
+        )
+        restored_depth[prefix_mask] = self._depth_prefix[source[prefix_mask], source_env[prefix_mask]]
+        current_mask = ~prefix_mask
+        restored_depth[current_mask] = depth[
+            source[current_mask] - max_offset, source_env[current_mask]
+        ]
+        observations.set(self.depth_observation_key, restored_depth)
+        return observations
+
+    def _restore_all_depth(self) -> TensorDict:
+        """Rebuild the full rollout depth tensor for recurrent trajectory splitting."""
+        time_idx = torch.arange(self.num_transitions_per_env, device=self.device).repeat_interleave(self.num_envs)
+        env_idx = torch.arange(self.num_envs, device=self.device).repeat(self.num_transitions_per_env)
+        observations = self.observations.clone()
+        flat_observations = self.observations.flatten(0, 1)[torch.arange(len(time_idx), device=self.device)]
+        restored = self._restore_depth(flat_observations, time_idx, env_idx).get(self.depth_observation_key)
+        observations.set(
+            self.depth_observation_key,
+            restored.reshape(self.num_transitions_per_env, self.num_envs, *restored.shape[1:]),
+        )
+        return observations
 
     def _save_hidden_states(self, hidden_states: tuple[HiddenState, HiddenState]) -> None:
         """Save recurrent hidden states to the rollout storage."""
